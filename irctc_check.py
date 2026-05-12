@@ -1,10 +1,13 @@
 """
 Primary checker: drives IRCTC's actual search page with Playwright.
-Replicates the exact manual flow shown in the user's screenshot:
-  From = MADGAON - MAO, To = THANE - TNA, Date = 16/06/2026,
-  Class = Exec. Chair Car (EC), Quota = GENERAL.
 
-Returns a CheckResult describing what was observed.
+Hardening principles:
+1. Take a screenshot at every milestone. The `last_screenshot` variable is the
+   "latest visible state" — returned even on partial failure.
+2. Multiple selector strategies per field. Try formcontrolname first (most
+   stable), then placeholder, then visible label.
+3. Aggressively dismiss any modal/popup before form fill.
+4. Never let an exception escape this module — return a CheckResult instead.
 """
 from __future__ import annotations
 
@@ -15,6 +18,7 @@ from pathlib import Path
 
 from playwright.sync_api import (
     Browser,
+    Locator,
     Page,
     TimeoutError as PWTimeout,
     sync_playwright,
@@ -37,157 +41,356 @@ IRCTC_URL = "https://www.irctc.co.in/nget/train-search"
 
 @dataclass
 class CheckResult:
-    train_found: bool          # Does train 22230 appear in the results list?
-    booking_open: bool         # Does it appear bookable (not greyed/ARP)?
-    raw_signal: str            # Short string describing what was detected
+    train_found: bool
+    booking_open: bool
+    raw_signal: str
     screenshot_path: str | None
     error: str | None = None
+    threw: bool = False  # True only if exception escaped to module boundary
 
 
-def _fill_station(page: Page, placeholder_text: str, value: str) -> None:
-    """Type into IRCTC's autocomplete station field and pick the first result."""
-    # IRCTC uses p-autoComplete; the visible input has a placeholder.
-    # Robust selector: <input> inside element whose placeholder matches.
-    inp = page.locator(f"input[placeholder*='{placeholder_text}']").first
+# --- Helpers --------------------------------------------------------------
+def _shoot(page: Page, label: str) -> str | None:
+    """Take a full-page screenshot. Returns path or None on failure."""
+    try:
+        Path(SCREENSHOT_DIR).mkdir(exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        path = f"{SCREENSHOT_DIR}/{ts}-{label}.png"
+        page.screenshot(path=path, full_page=True, timeout=15000)
+        return path
+    except Exception as e:
+        print(f"  [warn] screenshot {label!r} failed: {e}")
+        return None
+
+
+def _dismiss_popups(page: Page) -> None:
+    """IRCTC shows various popups (Disha bot, service notices). Try to close all."""
+    selectors = [
+        "button.btn-modal-close",
+        "button:has-text('OK')",
+        "button:has-text('Ok')",
+        ".close",
+        "[aria-label='Close']",
+        "i.fa-times",
+        "p-dialog button.ui-dialog-titlebar-close",
+        "div.disha-banner i",
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            count = loc.count()
+            for i in range(min(count, 3)):
+                try:
+                    loc.nth(i).click(timeout=1500)
+                    page.wait_for_timeout(300)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    # Also press Escape a couple of times in case a dialog is focused
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(200)
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+
+def _find_station_input(page: Page, which: str) -> Locator:
+    """Locate the From or To autocomplete input. which is 'origin' or 'destination'."""
+    candidates = [
+        f"p-autocomplete[formcontrolname='{which}'] input",
+        f"[formcontrolname='{which}'] input",
+        f"input[placeholder='{'From' if which == 'origin' else 'To'}*']",
+        f"input[placeholder*='{'From' if which == 'origin' else 'To'}']",
+    ]
+    last_err = None
+    for sel in candidates:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0:
+                # Verify it's actually visible
+                loc.wait_for(state="visible", timeout=3000)
+                return loc
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Could not find {which} input. Last error: {last_err}")
+
+
+def _fill_station(page: Page, which: str, station_text: str) -> None:
+    inp = _find_station_input(page, which)
     inp.click(timeout=ACTION_TIMEOUT * 1000)
     inp.fill("")
-    inp.type(value, delay=40)
-    # Wait for dropdown options, click first
-    page.locator("ul.ui-autocomplete-items li").first.click(timeout=ACTION_TIMEOUT * 1000)
+    inp.type(station_text, delay=60)
+    # Wait for autocomplete dropdown
+    dropdown_selectors = [
+        "ul.ui-autocomplete-items li",
+        ".ui-autocomplete-items li",
+        "[role='listbox'] [role='option']",
+        ".ng-tns-c75 li",  # PrimeNG class pattern, may vary
+    ]
+    for sel in dropdown_selectors:
+        try:
+            page.locator(sel).first.wait_for(state="visible", timeout=4000)
+            page.locator(sel).first.click(timeout=3000)
+            return
+        except Exception:
+            continue
+    # Fallback: just press Enter, IRCTC sometimes accepts that
+    inp.press("Enter")
 
 
 def _set_date(page: Page, ddmmyyyy: str) -> None:
-    """Overwrite the journey date field."""
-    date_inp = page.locator("input[formcontrolname='journeyDate']").first
-    date_inp.click()
-    date_inp.press("Control+A")
-    date_inp.type(ddmmyyyy, delay=30)
-    # Press Escape to close the date picker overlay
+    candidates = [
+        "p-calendar[formcontrolname='journeyDate'] input",
+        "input[formcontrolname='journeyDate']",
+        "input[placeholder='DD/MM/YYYY*']",
+        "input[placeholder*='DD/MM']",
+    ]
+    inp = None
+    for sel in candidates:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0:
+                inp = loc
+                break
+        except Exception:
+            continue
+    if inp is None:
+        raise RuntimeError("Could not find date input")
+    inp.click(timeout=ACTION_TIMEOUT * 1000)
+    inp.press("Control+A")
+    inp.press("Delete")
+    inp.type(ddmmyyyy, delay=40)
     page.keyboard.press("Escape")
+    page.wait_for_timeout(400)
 
 
 def _select_dropdown(page: Page, formcontrolname: str, option_label: str) -> None:
-    """Select an option from a p-dropdown by visible label."""
-    dropdown = page.locator(f"p-dropdown[formcontrolname='{formcontrolname}']").first
-    dropdown.click()
-    page.locator("li[role='option']", has_text=option_label).first.click(
-        timeout=ACTION_TIMEOUT * 1000
-    )
-
-
-def _shoot(page: Page, label: str) -> str:
-    Path(SCREENSHOT_DIR).mkdir(exist_ok=True)
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    path = f"{SCREENSHOT_DIR}/{ts}-{label}.png"
-    try:
-        page.screenshot(path=path, full_page=True)
-    except Exception:
-        return ""
-    return path
-
-
-def check_irctc() -> CheckResult:
-    with sync_playwright() as pw:
-        browser: Browser = pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        ctx = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1366, "height": 900},
-            locale="en-IN",
-        )
-        page = ctx.new_page()
-        page.set_default_timeout(ACTION_TIMEOUT * 1000)
-        screenshot = None
-
+    dropdown_candidates = [
+        f"p-dropdown[formcontrolname='{formcontrolname}']",
+        f"[formcontrolname='{formcontrolname}']",
+    ]
+    dropdown = None
+    for sel in dropdown_candidates:
         try:
-            page.goto(IRCTC_URL, timeout=PAGE_LOAD_TIMEOUT * 1000, wait_until="networkidle")
-        except PWTimeout:
-            screenshot = _shoot(page, "load-timeout")
-            return CheckResult(False, False, "irctc_load_timeout", screenshot,
-                               error="IRCTC page did not finish loading")
-
-        # Some days IRCTC shows a popup ("Disha" chatbot or service notice). Close if present.
-        try:
-            close_btns = page.locator("button:has-text('OK'), .close, [aria-label='Close']")
-            if close_btns.count() > 0:
-                close_btns.first.click(timeout=2000)
+            loc = page.locator(sel).first
+            if loc.count() > 0:
+                dropdown = loc
+                break
         except Exception:
-            pass
-
+            continue
+    if dropdown is None:
+        raise RuntimeError(f"Could not find dropdown {formcontrolname}")
+    dropdown.click(timeout=ACTION_TIMEOUT * 1000)
+    page.wait_for_timeout(500)
+    option_candidates = [
+        f"li[role='option']:has-text('{option_label}')",
+        f"[role='option']:has-text('{option_label}')",
+        f"li:has-text('{option_label}')",
+        f"span:has-text('{option_label}')",
+    ]
+    for sel in option_candidates:
         try:
-            _fill_station(page, "From", SOURCE_NAME.split(" - ")[0])
-            _fill_station(page, "To", DEST_NAME.split(" - ")[0])
-            _set_date(page, JOURNEY_DATE_DDMMYYYY)
-            _select_dropdown(page, "journeyClass", TRAVEL_CLASS_LABEL)
-            _select_dropdown(page, "journeyQuota", QUOTA_LABEL)
-        except Exception as e:
-            screenshot = _shoot(page, "form-fill-failed")
-            return CheckResult(False, False, "form_fill_failed", screenshot, error=str(e))
+            page.locator(sel).first.click(timeout=3000)
+            return
+        except Exception:
+            continue
+    raise RuntimeError(f"Could not find option '{option_label}' in {formcontrolname}")
 
-        screenshot_pre = _shoot(page, "before-search")
 
-        # Click Search Trains
-        try:
-            page.locator("button:has-text('Search')").first.click()
-        except Exception as e:
-            return CheckResult(False, False, "search_click_failed",
-                               screenshot_pre, error=str(e))
+# --- Main entry -----------------------------------------------------------
+def check_irctc() -> CheckResult:
+    """Returns a CheckResult. Never raises."""
+    last_screenshot: str | None = None
+    err_msg: str | None = None
+    signal = "started"
+    train_found = False
+    booking_open = False
 
-        # Wait for either results or an error banner. Results render as <app-train-avl-enq>
-        # nodes; error banners are <p-toast> elements.
-        try:
-            page.wait_for_selector(
-                "app-train-avl-enq, p-toast .ui-toast-detail, .alert",
-                timeout=PAGE_LOAD_TIMEOUT * 1000,
+    try:
+        with sync_playwright() as pw:
+            browser: Browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    # IRCTC sends broken HTTP/2 frames; force HTTP/1.1
+                    "--disable-http2",
+                    "--disable-features=UseHttp2,SpdyForOverHttp2,EnableQuic",
+                ],
             )
-        except PWTimeout:
-            screenshot = _shoot(page, "no-results-render")
-            return CheckResult(False, False, "results_not_rendered",
-                               screenshot, error="results did not render")
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1366, "height": 900},
+                locale="en-IN",
+            )
+            page = ctx.new_page()
+            page.set_default_timeout(ACTION_TIMEOUT * 1000)
 
-        # Give the list a moment to fully populate
-        page.wait_for_timeout(2000)
-        screenshot = _shoot(page, "results")
+            # Step 1: Load page (retry with looser wait condition on failure)
+            load_err: str | None = None
+            for attempt in range(2):
+                try:
+                    wait_until = "domcontentloaded" if attempt == 0 else "commit"
+                    page.goto(IRCTC_URL,
+                              timeout=PAGE_LOAD_TIMEOUT * 1000,
+                              wait_until=wait_until)
+                    page.wait_for_timeout(3000 if attempt == 0 else 5000)
+                    load_err = None
+                    break
+                except Exception as e:
+                    load_err = str(e)[:300]
+                    print(f"  [warn] goto attempt {attempt + 1} failed: "
+                          f"{load_err[:150]}")
+                    page.wait_for_timeout(1500)
 
-        # Capture the rendered text of the results region
-        body_text = page.locator("body").inner_text()
+            if load_err is not None:
+                last_screenshot = _shoot(page, "01-load-failed")
+                browser.close()
+                return CheckResult(False, False, "irctc_load_failed",
+                                   last_screenshot, error=load_err)
+            last_screenshot = _shoot(page, "01-loaded")
+            signal = "page_loaded"
 
-        # Check for IRCTC's "No direct trains" or ARP error
-        if re.search(r"no direct trains|train not available|ARP", body_text, re.I):
-            return CheckResult(False, False, "no_direct_trains_or_arp", screenshot)
+            # Step 2: Dismiss any popups
+            _dismiss_popups(page)
+            page.wait_for_timeout(500)
+            last_screenshot = _shoot(page, "02-popups-dismissed") or last_screenshot
 
-        train_found = bool(re.search(rf"\b{TRAIN_NUMBER}\b", body_text))
+            # Step 3: Fill From
+            try:
+                _fill_station(page, "origin", SOURCE_NAME.split(" - ")[0])
+                last_screenshot = _shoot(page, "03-from-filled") or last_screenshot
+                signal = "from_filled"
+            except Exception as e:
+                err_msg = f"from_fill_failed: {e}"
+                last_screenshot = _shoot(page, "03-from-fail") or last_screenshot
+                browser.close()
+                return CheckResult(False, False, "form_fill_failed",
+                                   last_screenshot, error=err_msg)
 
-        # If train is listed, look for booking-state indicators near the train.
-        # IRCTC shows class tiles with status: AVAILABLE-NNNN, RAC NNN, WL NNN,
-        # REGRET/WL, NOT AVBL, TRAIN DEPARTED, BOOKING NOT STARTED.
-        booking_open = False
-        signal = "train_not_in_list"
+            # Step 4: Fill To
+            try:
+                _fill_station(page, "destination", DEST_NAME.split(" - ")[0])
+                last_screenshot = _shoot(page, "04-to-filled") or last_screenshot
+                signal = "to_filled"
+            except Exception as e:
+                err_msg = f"to_fill_failed: {e}"
+                last_screenshot = _shoot(page, "04-to-fail") or last_screenshot
+                browser.close()
+                return CheckResult(False, False, "form_fill_failed",
+                                   last_screenshot, error=err_msg)
 
-        if train_found:
-            # Slice the page text around the train number to inspect locally
-            idx = body_text.find(TRAIN_NUMBER)
-            window = body_text[max(0, idx - 200): idx + 1500]
-            if re.search(r"AVAILABLE|RAC|WL\s*\d+|REGRET", window, re.I):
-                booking_open = True
-                signal = "available_or_waitlist"
-            elif re.search(r"BOOKING\s+NOT\s+STARTED|ARP", window, re.I):
-                booking_open = False
-                signal = "booking_not_started"
-            elif re.search(r"TRAIN\s+CANCELLED|TRAIN\s+DEPARTED|NOT\s+AVBL", window, re.I):
-                booking_open = False
-                signal = "train_cancelled_or_departed"
+            # Step 5: Set date
+            try:
+                _set_date(page, JOURNEY_DATE_DDMMYYYY)
+                last_screenshot = _shoot(page, "05-date-set") or last_screenshot
+                signal = "date_set"
+            except Exception as e:
+                err_msg = f"date_set_failed: {e}"
+                last_screenshot = _shoot(page, "05-date-fail") or last_screenshot
+                browser.close()
+                return CheckResult(False, False, "form_fill_failed",
+                                   last_screenshot, error=err_msg)
+
+            # Step 6: Class (optional - if it fails, continue with default)
+            try:
+                _select_dropdown(page, "journeyClass", TRAVEL_CLASS_LABEL)
+                signal = "class_selected"
+            except Exception as e:
+                print(f"  [warn] class select failed (continuing): {e}")
+
+            # Step 7: Quota (optional - default is GENERAL anyway)
+            try:
+                _select_dropdown(page, "journeyQuota", QUOTA_LABEL)
+                signal = "quota_selected"
+            except Exception as e:
+                print(f"  [warn] quota select failed (continuing): {e}")
+
+            last_screenshot = _shoot(page, "06-form-complete") or last_screenshot
+
+            # Step 8: Click Search
+            try:
+                search_candidates = [
+                    "button.search_btn",
+                    "button:has-text('Search')",
+                    "button.train_Search",
+                ]
+                clicked = False
+                for sel in search_candidates:
+                    try:
+                        page.locator(sel).first.click(timeout=4000)
+                        clicked = True
+                        break
+                    except Exception:
+                        continue
+                if not clicked:
+                    raise RuntimeError("could not click Search button")
+            except Exception as e:
+                err_msg = f"search_click_failed: {e}"
+                last_screenshot = _shoot(page, "07-search-click-fail") or last_screenshot
+                browser.close()
+                return CheckResult(False, False, "search_click_failed",
+                                   last_screenshot, error=err_msg)
+
+            # Step 9: Wait for results to render
+            try:
+                page.wait_for_selector(
+                    "app-train-avl-enq, p-toast .ui-toast-detail, "
+                    ".alert, .train_list, .err-toast-message",
+                    timeout=PAGE_LOAD_TIMEOUT * 1000,
+                )
+                page.wait_for_timeout(2500)
+            except PWTimeout:
+                last_screenshot = _shoot(page, "08-no-results") or last_screenshot
+                browser.close()
+                return CheckResult(False, False, "results_not_rendered",
+                                   last_screenshot,
+                                   error="results did not render in time")
+
+            last_screenshot = _shoot(page, "09-results") or last_screenshot
+
+            # Step 10: Parse results
+            body_text = page.locator("body").inner_text()
+            train_found = bool(re.search(rf"\b{TRAIN_NUMBER}\b", body_text))
+
+            # Look for IRCTC error toasts
+            err_toast = re.search(
+                r"(no direct trains|train not available|booking not.{0,30}allowed|"
+                r"ARP|advance reservation period)",
+                body_text, re.I,
+            )
+
+            if err_toast and not train_found:
+                signal = f"irctc_toast: {err_toast.group(0)[:80]}"
+            elif train_found:
+                idx = body_text.find(TRAIN_NUMBER)
+                window = body_text[max(0, idx - 200): idx + 1500]
+                if re.search(r"AVAILABLE|RAC|WL\s*\d+|REGRET", window, re.I):
+                    booking_open = True
+                    signal = "available_or_waitlist"
+                elif re.search(r"BOOKING\s+NOT\s+STARTED", window, re.I):
+                    signal = "booking_not_started"
+                elif re.search(r"TRAIN\s+CANCELLED|TRAIN\s+DEPARTED|NOT\s+AVBL",
+                               window, re.I):
+                    signal = "train_cancelled_or_departed"
+                else:
+                    booking_open = True
+                    signal = "train_listed_status_unclear"
             else:
-                # Train is listed but no class status text — treat as listed but unknown.
-                # For a fresh ARP-opened day, IRCTC almost always shows AVAILABLE-XXXX,
-                # so "listed without status" is unusual.
-                booking_open = True
-                signal = "train_listed_status_unclear"
+                signal = "train_not_in_results"
 
-        browser.close()
-        return CheckResult(train_found, booking_open, signal, screenshot)
+            browser.close()
+            return CheckResult(train_found, booking_open, signal,
+                               last_screenshot, error=err_msg)
+
+    except Exception as e:
+        # Catastrophic failure (e.g., Playwright not installed, browser crashed)
+        return CheckResult(False, False, "playwright_crashed",
+                           last_screenshot, error=str(e), threw=True)
