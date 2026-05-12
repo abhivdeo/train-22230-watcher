@@ -233,28 +233,60 @@ def check_irctc() -> CheckResult:
             page = ctx.new_page()
             page.set_default_timeout(ACTION_TIMEOUT * 1000)
 
-            # Step 1: Load page (retry with looser wait condition on failure)
+            # Block analytics/ads — they often stall the load event on IRCTC
+            def _blocker(route):
+                url = route.request.url.lower()
+                blocked = ["google-analytics", "googletagmanager", "doubleclick",
+                           "facebook.net", "hotjar", "clarity.ms", "googleadservices"]
+                if any(b in url for b in blocked):
+                    return route.abort()
+                return route.continue_()
+            try:
+                page.route("**/*", _blocker)
+            except Exception:
+                pass
+
+            # Step 1: Load page. IRCTC is often very slow for non-IN IPs.
+            # We try progressively looser wait conditions; on each attempt's
+            # timeout we still try to proceed since the DOM may be usable.
             load_err: str | None = None
-            for attempt in range(2):
+            for attempt, wait_until in enumerate(["domcontentloaded", "commit"]):
                 try:
-                    wait_until = "domcontentloaded" if attempt == 0 else "commit"
                     page.goto(IRCTC_URL,
                               timeout=PAGE_LOAD_TIMEOUT * 1000,
                               wait_until=wait_until)
-                    page.wait_for_timeout(3000 if attempt == 0 else 5000)
                     load_err = None
                     break
                 except Exception as e:
                     load_err = str(e)[:300]
-                    print(f"  [warn] goto attempt {attempt + 1} failed: "
-                          f"{load_err[:150]}")
-                    page.wait_for_timeout(1500)
+                    print(f"  [warn] goto attempt {attempt + 1} "
+                          f"({wait_until}) failed: {load_err[:150]}")
 
-            if load_err is not None:
-                last_screenshot = _shoot(page, "01-load-failed")
+            # Whether goto succeeded or timed out, give the page time to render
+            # and check if the form is actually usable. Many timeouts are
+            # caused by tracking scripts / ads stalling, not the form itself.
+            page.wait_for_timeout(5000)
+            last_screenshot = _shoot(page, "01-after-load")
+
+            # Real success criterion: is there an input we can type into?
+            form_usable = False
+            try:
+                page.wait_for_selector("input", state="visible", timeout=15000)
+                form_usable = True
+                signal = "page_usable"
+            except Exception:
+                pass
+
+            if not form_usable:
+                err_for_return = load_err or "page never rendered an input"
                 browser.close()
                 return CheckResult(False, False, "irctc_load_failed",
-                                   last_screenshot, error=load_err)
+                                   last_screenshot, error=err_for_return)
+
+            if load_err:
+                # Form is usable despite goto timeout — log but continue
+                print(f"  [info] proceeding despite goto timeout: "
+                      f"{load_err[:100]}")
             last_screenshot = _shoot(page, "01-loaded")
             signal = "page_loaded"
 
