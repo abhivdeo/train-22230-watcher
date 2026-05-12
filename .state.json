@@ -1,9 +1,9 @@
 {
   "alerted": false,
   "alerted_at": null,
-  "checks": 2,
-  "last_check": "2026-05-12T10:22:25.155743+00:00",
-  "last_status": "NOT_LISTED",
-  "last_method": "confirmtkt_fallback",
-  "last_error": null
+  "checks": 3,
+  "last_check": "2026-05-12T11:25:40.306351+00:00",
+  "last_status": "ERROR",
+  "last_method": "irctc_playwright",
+  "last_error": "Page.goto: Timeout 60000ms exceeded.\nCall log:\nnavigating to \"https://www.irctc.co.in/nget/train-search\", waiting until \"commit\"\n"
 }
