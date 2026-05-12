@@ -1,0 +1,72 @@
+name: Daily Train 22230 Check
+
+on:
+  schedule:
+    # 5:00 PM IST = 11:30 AM UTC, every day.
+    # Note: GitHub Actions scheduled runs can be delayed under load — typically
+    # arrive within 0-15 min of the cron time. That's fine for a daily report.
+    - cron: "30 11 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "daily"
+        type: choice
+        options: ["daily", "once", "test-email", "reset"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: train-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run watcher
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          MODE="${{ github.event.inputs.mode || 'daily' }}"
+          python check_train.py "$MODE"
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: screenshots/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Commit state file
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [[ -n "$(git status --porcelain .state.json 2>/dev/null)" ]]; then
+            git add .state.json
+            git commit -m "chore: daily state update [skip ci]"
+            git push
+          else
+            echo "No state changes."
+          fi
